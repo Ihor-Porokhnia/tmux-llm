@@ -1,14 +1,20 @@
 import asyncio
 import json
-import logging
 import os
 import re
 import subprocess
 import time
 import traceback
+import sys
 from pathlib import Path
 from textwrap import dedent
 
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
+
+from loguru import logger as log
 from openai import OpenAI
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -43,6 +49,18 @@ DEFAULT_INSTRUCTIONS = dedent(
     BASH may include creating files and executing them, but must remain runnable without manual editing unless explicitly unavoidable; if unavoidable, mark assumptions in HUMAN and keep BASH runnable.
     """
 ).strip()
+
+DEFAULT_LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+DEFAULT_LOGGING_CONFIG = {
+    "level": "INFO",
+    "stderr_level": "WARNING",
+    "rotation": "5 MB",
+    "retention": 10,
+    "error_rotation": "2 MB",
+    "error_retention": 15,
+    "format": DEFAULT_LOG_FORMAT,
+    "stderr": True,
+}
 
 
 def sh(args, input_text=None, check=True):
@@ -97,43 +115,137 @@ def resolve_paths(app_name="tmux-llm"):
     return {"base": base, "run": run_dir, "hist": hist_dir, "logs": logs_dir, "tmp": tmp_dir}
 
 
-def open_log(paths):
+def open_log(paths, logging_cfg=None):
     log_path = paths["logs"] / "tmux-llm.log"
-    logger = logging.getLogger("tmux-llm")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.propagate = False
+    err_path = paths["logs"] / "tmux-llm.error.log"
+    cfg = {**DEFAULT_LOGGING_CONFIG, **(logging_cfg or {})}
+    fmt = cfg.get("format", DEFAULT_LOG_FORMAT)
+    log.remove()
+    log.add(
+        log_path,
+        rotation=cfg.get("rotation", DEFAULT_LOGGING_CONFIG["rotation"]),
+        retention=cfg.get("retention", DEFAULT_LOGGING_CONFIG["retention"]),
+        enqueue=True,
+        backtrace=True,
+        diagnose=False,
+        level=cfg.get("level", DEFAULT_LOGGING_CONFIG["level"]),
+        encoding="utf-8",
+        format=fmt,
+    )
+    log.add(
+        err_path,
+        rotation=cfg.get("error_rotation", DEFAULT_LOGGING_CONFIG["error_rotation"]),
+        retention=cfg.get("error_retention", DEFAULT_LOGGING_CONFIG["error_retention"]),
+        enqueue=True,
+        backtrace=True,
+        diagnose=False,
+        level="ERROR",
+        encoding="utf-8",
+        format=fmt,
+    )
+    if cfg.get("stderr", True):
+        log.add(
+            sys.stderr,
+            level=cfg.get("stderr_level", DEFAULT_LOGGING_CONFIG["stderr_level"]),
+            backtrace=False,
+            diagnose=False,
+            format=fmt,
+        )
+    bound_logger = log.bind(component="tmux-llm")
 
     def log_exc(prefix, e):
-        logger.error("%s %r\n%s", prefix, e, traceback.format_exc())
+        bound_logger.opt(exception=e).error("{} {}", prefix, e)
 
-    return logger, log_path, log_exc
+    return bound_logger, log_path, log_exc
 
 
 def load_config():
-    cfg_path = Path.home() / ".local" / "config" / "tmux-llm.conf"
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    default = {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS}
+    cfg_path = _config_path()
+    cfg_raw = _read_config(cfg_path)
+    if cfg_raw is None:
+        cfg_raw = {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS, "logging": DEFAULT_LOGGING_CONFIG}
+        cfg_path.write_text(_render_config(cfg_raw), encoding="utf-8")
+    filters = _normalize_filters(cfg_raw.get("filters"))
+    instructions = _normalize_instructions(cfg_raw.get("instructions"))
+    logging_cfg = _normalize_logging(cfg_raw.get("logging"))
+    return {"filters": filters, "instructions": instructions, "logging": logging_cfg, "path": cfg_path}
+
+
+def _config_path():
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "tmux-llm" / "config"
+    cfg_dir = base
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    return cfg_dir / "config.toml"
+
+
+def _normalize_filters(filters):
+    if isinstance(filters, list):
+        return [str(f) for f in filters if isinstance(f, str) and f.strip()]
+    return DEFAULT_FILTER_PATTERNS
+
+
+def _normalize_instructions(instructions):
+    if isinstance(instructions, str) and instructions.strip():
+        return instructions
+    return DEFAULT_INSTRUCTIONS
+
+
+def _normalize_logging(logging_cfg):
+    if not isinstance(logging_cfg, dict):
+        return DEFAULT_LOGGING_CONFIG
+    cfg = {**DEFAULT_LOGGING_CONFIG}
+    for k, v in logging_cfg.items():
+        if v is None:
+            continue
+        cfg[k] = v
+    return cfg
+
+
+def _read_config(cfg_path):
     try:
         if cfg_path.exists():
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            filters = data.get("filters") or default["filters"]
-            instructions = data.get("instructions") or default["instructions"]
-            return {"filters": filters, "instructions": instructions, "path": cfg_path}
+            return tomllib.loads(cfg_path.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    cfg_path.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"filters": default["filters"], "instructions": default["instructions"], "path": cfg_path}
+        return {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS, "logging": DEFAULT_LOGGING_CONFIG}
+    return None
+
+
+def _render_config(cfg):
+    filters = _normalize_filters(cfg.get("filters"))
+    instructions = _normalize_instructions(cfg.get("instructions")).strip("\n")
+    logging_cfg = _normalize_logging(cfg.get("logging"))
+    filters_toml = ",\n".join([f"  {json.dumps(f, ensure_ascii=False)}" for f in filters])
+    retention = logging_cfg.get("retention", DEFAULT_LOGGING_CONFIG["retention"])
+    error_retention = logging_cfg.get("error_retention", DEFAULT_LOGGING_CONFIG["error_retention"])
+    retention_line = f"retention = {retention}\n" if isinstance(retention, (int, float)) else f'retention = "{retention}"\n'
+    error_retention_line = (
+        f"error_retention = {error_retention}\n"
+        if isinstance(error_retention, (int, float))
+        else f'error_retention = "{error_retention}"\n'
+    )
+    return (
+        "# tmux-llm configuration\n"
+        "# Edit values and restart tmux-llm to apply changes.\n"
+        "filters = [\n"
+        f"{filters_toml}\n"
+        "]\n\n"
+        f'instructions = """\n{instructions}\n"""\n\n'
+        "[logging]\n"
+        f'level = "{logging_cfg.get("level", DEFAULT_LOGGING_CONFIG["level"])}"\n'
+        f'stderr_level = "{logging_cfg.get("stderr_level", DEFAULT_LOGGING_CONFIG["stderr_level"])}"\n'
+        f'stderr = {"true" if logging_cfg.get("stderr", DEFAULT_LOGGING_CONFIG["stderr"]) else "false"}\n'
+        f'rotation = "{logging_cfg.get("rotation", DEFAULT_LOGGING_CONFIG["rotation"])}"\n'
+        f"{retention_line}"
+        f'error_rotation = "{logging_cfg.get("error_rotation", DEFAULT_LOGGING_CONFIG["error_rotation"])}"\n'
+        f"{error_retention_line}"
+        f'format = "{logging_cfg.get("format", DEFAULT_LOG_FORMAT)}"\n'
+    )
 
 
 class TextFilters:
     def __init__(self, api_key="", patterns=None):
         self.api_key = (api_key or "").strip()
-        self._filters = [self._redact_openai_api_key]
+        self._filters = [self._redact_sensitive_values]
         self._api_key_patterns = [re.compile(p) for p in (patterns or [])]
         if self.api_key:
             self._api_key_patterns.append(re.compile(re.escape(self.api_key)))
@@ -161,7 +273,7 @@ class TextFilters:
             return {k: self.apply_obj(v) for k, v in o.items()}
         return o
 
-    def _redact_openai_api_key(self, s):
+    def _redact_sensitive_values(self, s):
         out = s
         for rx in self._api_key_patterns:
             def _repl(m):
@@ -207,13 +319,13 @@ def build_ctx(hist_rows, filters):
     return filters.apply_obj(ctx)
 
 
-def call_model_blocking(api_key, model, cap, notes, hist_path, m, paths, filters, instructions):
+def call_model_blocking(api_key, model, pane_capture, notes, hist_path, m, paths, filters, instructions):
     run_dir = paths["run"]
     human_path = str(run_dir / "human.txt")
     bash_path = str(run_dir / "bash.sh")
     hist_rows = load_history(hist_path, m, filters)
     ctx = build_ctx(hist_rows, filters)
-    cap_s = filters.apply(cap)
+    cap_s = filters.apply(pane_capture)
     notes_s = filters.apply(notes)
     user_in = "TERMINAL OUTPUT:\n" + cap_s + "\n\nUSER NOTES:\n" + (notes_s if notes_s else "(none)") + "\n"
     client = OpenAI(api_key=api_key)
@@ -250,7 +362,7 @@ def capture_clean(pane_id, n_lines):
 async def run_tmux_llm():
     config = load_config()
     paths = resolve_paths("tmux-llm")
-    logger, log_path, log_exc = open_log(paths)
+    logger, log_path, log_exc = open_log(paths, config.get("logging"))
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("OPENAI_API_KEY is missing in environment")
@@ -270,8 +382,15 @@ async def run_tmux_llm():
     ensure_empty_file(bash_path)
     n_lines = int(os.environ.get("TMUX_LLM_LINES", "400"))
     m_turns = int(os.environ.get("TMUX_LLM_TURNS", "6"))
-    cap = filters.apply(capture_clean(pane_id, n_lines))
-    write_file(cap_path, cap)
+    logger.info(
+        "tmux-llm session starting pane_id={} model={} lines={} turns={}",
+        pane_id,
+        model,
+        n_lines,
+        m_turns,
+    )
+    pane_capture = filters.apply(capture_clean(pane_id, n_lines))
+    write_file(cap_path, pane_capture)
     style = Style.from_dict({"frame.border": "ansiblue", "title": "ansicyan bold"})
     kb = KeyBindings()
     header = FormattedTextControl(text=[("class:title", "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F10/Esc: quit")])
@@ -280,7 +399,7 @@ async def run_tmux_llm():
     def set_status(s):
         status.text = [("", s)]
 
-    preview = TextArea(text=(" %d lines from %s\n" % (n_lines, pane_id)) + cap, read_only=True, scrollbar=True, wrap_lines=False)
+    preview = TextArea(text=(" %d lines from %s\n" % (n_lines, pane_id)) + pane_capture, read_only=True, scrollbar=True, wrap_lines=False)
     notes = TextArea(text="", multiline=True, scrollbar=True, wrap_lines=True)
     bash = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=False)
     human = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=True)
@@ -306,6 +425,7 @@ async def run_tmux_llm():
             return
         refreshing["busy"] = True
         try:
+            logger.info("Refreshing preview for pane {} with {} windows", pane_id, len(delays))
             for d in delays:
                 await asyncio.sleep(d)
                 cap2 = filters.apply(capture_clean(pane_id, n_lines))
@@ -330,12 +450,14 @@ async def run_tmux_llm():
         app.invalidate()
         try:
             loop = asyncio.get_running_loop()
-            h, b = await loop.run_in_executor(None, call_model_blocking, api_key, model, cap, notes_text, hist_path, m_turns, paths, filters, config["instructions"])
+            logger.info("Sending prompt to model={} captured_lines={} notes_length={}", model, n_lines, len(notes_text))
+            h, b = await loop.run_in_executor(None, call_model_blocking, api_key, model, pane_capture, notes_text, hist_path, m_turns, paths, filters, config["instructions"])
             human.text = h
             bash.text = b
             notes.text = ""
             write_file(notes_path, "")
             set_status("Received. Press F6 to paste.")
+            logger.info("Model response received bash_len={} human_len={}", len(b), len(h))
         except Exception as e:
             et = "(MODEL ERROR)\n" + repr(e) + "\n\n" + traceback.format_exc()
             et = filters.apply(et)
@@ -358,10 +480,12 @@ async def run_tmux_llm():
         bt = bash.text
         if not bt.strip():
             set_status("BASH is empty; nothing to paste.")
+            logger.warning("Paste requested with empty BASH output for pane {}", pane_id)
             return
         try:
             tmux_paste_and_enter(pane_id, bt)
             set_status(f"Pasted+Enter into {pane_id}. Refreshing preview...")
+            logger.info("Pasted model output into pane {}", pane_id)
             asyncio.create_task(refresh_preview_multi([0.15, 0.6, 1.5, 2.5, 3.5]))
         except Exception as e:
             set_status(f"Paste failed; see {log_path}.")
@@ -383,7 +507,11 @@ def main():
     except Exception as e:
         try:
             paths = resolve_paths("tmux-llm")
-            logger, log_path, log_exc = open_log(paths)
+            try:
+                cfg = load_config()
+            except Exception:
+                cfg = None
+            logger, log_path, log_exc = open_log(paths, (cfg or {}).get("logging"))
             log_exc("(FATAL)", e)
         except Exception:
             pass
