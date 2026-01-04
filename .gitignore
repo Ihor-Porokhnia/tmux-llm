@@ -1,0 +1,9 @@
+# Runtime/config artifacts; keep repository minimal
+config/
+share/
+bin/
+__pycache__/
+*.pyc
+*.log
+build/
+tmux_llm.egg-info/
