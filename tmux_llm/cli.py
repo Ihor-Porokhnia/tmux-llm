@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -63,41 +64,56 @@ DEFAULT_LOGGING_CONFIG = {
 }
 
 
-def sh(args, input_text=None, check=True):
-    p = subprocess.run(args, input=input_text, text=True, capture_output=True)
-    if check and p.returncode != 0:
+def run_command(args, input_text=None, check=True):
+    process = subprocess.run(args, input=input_text, text=True, capture_output=True)
+    if check and process.returncode != 0:
         raise RuntimeError(
-            f"cmd failed rc={p.returncode} cmd={' '.join(args)}\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}"
+            f"cmd failed rc={process.returncode} cmd={' '.join(args)}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
         )
-    return p.stdout
+    return process.stdout
 
 
-def strip_ansi(s):
-    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", s)
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
 
 
-def write_file(p, s):
-    Path(p).write_text(s, encoding="utf-8")
+def compute_cropped_preview(before, after):
+    before_lines = (before or "").splitlines()
+    after_lines = (after or "").splitlines()
+    if not after_lines:
+        return ""
+    sequence_matcher = difflib.SequenceMatcher(None, before_lines, after_lines)
+    new_lines = []
+    for tag, i1, i2, j1, j2 in sequence_matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            new_lines.extend(after_lines[j1:j2])
+    if not new_lines and before_lines != after_lines:
+        new_lines = after_lines
+    return "\n".join(new_lines).strip("\n")
 
 
-def read_file(p):
+def write_file(path, content):
+    Path(path).write_text(content, encoding="utf-8")
+
+
+def read_file(path):
     try:
-        return Path(p).read_text(encoding="utf-8", errors="replace")
+        return Path(path).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return ""
 
 
-def ensure_empty_file(p):
+def ensure_empty_file(path):
     try:
-        pp = Path(p)
-        pp.parent.mkdir(parents=True, exist_ok=True)
-        if pp.exists() and pp.stat().st_size > 0:
-            pp.write_text("", encoding="utf-8")
-        if not pp.exists():
-            pp.write_text("", encoding="utf-8")
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        if path_obj.exists() and path_obj.stat().st_size > 0:
+            path_obj.write_text("", encoding="utf-8")
+        if not path_obj.exists():
+            path_obj.write_text("", encoding="utf-8")
     except Exception:
         try:
-            Path(p).write_text("", encoding="utf-8")
+            Path(path).write_text("", encoding="utf-8")
         except Exception:
             pass
 
@@ -118,24 +134,24 @@ def resolve_paths(app_name="tmux-llm"):
 def open_log(paths, logging_cfg=None):
     log_path = paths["logs"] / "tmux-llm.log"
     err_path = paths["logs"] / "tmux-llm.error.log"
-    cfg = {**DEFAULT_LOGGING_CONFIG, **(logging_cfg or {})}
-    fmt = cfg.get("format", DEFAULT_LOG_FORMAT)
+    config = {**DEFAULT_LOGGING_CONFIG, **(logging_cfg or {})}
+    fmt = config.get("format", DEFAULT_LOG_FORMAT)
     log.remove()
     log.add(
         log_path,
-        rotation=cfg.get("rotation", DEFAULT_LOGGING_CONFIG["rotation"]),
-        retention=cfg.get("retention", DEFAULT_LOGGING_CONFIG["retention"]),
+        rotation=config.get("rotation", DEFAULT_LOGGING_CONFIG["rotation"]),
+        retention=config.get("retention", DEFAULT_LOGGING_CONFIG["retention"]),
         enqueue=True,
         backtrace=True,
         diagnose=False,
-        level=cfg.get("level", DEFAULT_LOGGING_CONFIG["level"]),
+        level=config.get("level", DEFAULT_LOGGING_CONFIG["level"]),
         encoding="utf-8",
         format=fmt,
     )
     log.add(
         err_path,
-        rotation=cfg.get("error_rotation", DEFAULT_LOGGING_CONFIG["error_rotation"]),
-        retention=cfg.get("error_retention", DEFAULT_LOGGING_CONFIG["error_retention"]),
+        rotation=config.get("error_rotation", DEFAULT_LOGGING_CONFIG["error_rotation"]),
+        retention=config.get("error_retention", DEFAULT_LOGGING_CONFIG["error_retention"]),
         enqueue=True,
         backtrace=True,
         diagnose=False,
@@ -143,10 +159,10 @@ def open_log(paths, logging_cfg=None):
         encoding="utf-8",
         format=fmt,
     )
-    if cfg.get("stderr", True):
+    if config.get("stderr", True):
         log.add(
             sys.stderr,
-            level=cfg.get("stderr_level", DEFAULT_LOGGING_CONFIG["stderr_level"]),
+            level=config.get("stderr_level", DEFAULT_LOGGING_CONFIG["stderr_level"]),
             backtrace=False,
             diagnose=False,
             format=fmt,
@@ -160,22 +176,22 @@ def open_log(paths, logging_cfg=None):
 
 
 def load_config():
-    cfg_path = _config_path()
-    cfg_raw = _read_config(cfg_path)
-    if cfg_raw is None:
-        cfg_raw = {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS, "logging": DEFAULT_LOGGING_CONFIG}
-        cfg_path.write_text(_render_config(cfg_raw), encoding="utf-8")
-    filters = _normalize_filters(cfg_raw.get("filters"))
-    instructions = _normalize_instructions(cfg_raw.get("instructions"))
-    logging_cfg = _normalize_logging(cfg_raw.get("logging"))
-    return {"filters": filters, "instructions": instructions, "logging": logging_cfg, "path": cfg_path}
+    config_path = _config_path()
+    config_raw = _read_config(config_path)
+    if config_raw is None:
+        config_raw = {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS, "logging": DEFAULT_LOGGING_CONFIG}
+        config_path.write_text(_render_config(config_raw), encoding="utf-8")
+    filters = _normalize_filters(config_raw.get("filters"))
+    instructions = _normalize_instructions(config_raw.get("instructions"))
+    logging_cfg = _normalize_logging(config_raw.get("logging"))
+    return {"filters": filters, "instructions": instructions, "logging": logging_cfg, "path": config_path}
 
 
 def _config_path():
     base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "tmux-llm" / "config"
-    cfg_dir = base
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    return cfg_dir / "config.toml"
+    config_dir = base
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "config.toml"
 
 
 def _normalize_filters(filters):
@@ -193,27 +209,27 @@ def _normalize_instructions(instructions):
 def _normalize_logging(logging_cfg):
     if not isinstance(logging_cfg, dict):
         return DEFAULT_LOGGING_CONFIG
-    cfg = {**DEFAULT_LOGGING_CONFIG}
-    for k, v in logging_cfg.items():
-        if v is None:
+    config = {**DEFAULT_LOGGING_CONFIG}
+    for key, value in logging_cfg.items():
+        if value is None:
             continue
-        cfg[k] = v
-    return cfg
+        config[key] = value
+    return config
 
 
-def _read_config(cfg_path):
+def _read_config(config_path):
     try:
-        if cfg_path.exists():
-            return tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+        if config_path.exists():
+            return tomllib.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
         return {"filters": DEFAULT_FILTER_PATTERNS, "instructions": DEFAULT_INSTRUCTIONS, "logging": DEFAULT_LOGGING_CONFIG}
     return None
 
 
-def _render_config(cfg):
-    filters = _normalize_filters(cfg.get("filters"))
-    instructions = _normalize_instructions(cfg.get("instructions")).strip("\n")
-    logging_cfg = _normalize_logging(cfg.get("logging"))
+def _render_config(config):
+    filters = _normalize_filters(config.get("filters"))
+    instructions = _normalize_instructions(config.get("instructions")).strip("\n")
+    logging_cfg = _normalize_logging(config.get("logging"))
     filters_toml = ",\n".join([f"  {json.dumps(f, ensure_ascii=False)}" for f in filters])
     retention = logging_cfg.get("retention", DEFAULT_LOGGING_CONFIG["retention"])
     error_retention = logging_cfg.get("error_retention", DEFAULT_LOGGING_CONFIG["error_retention"])
@@ -250,43 +266,43 @@ class TextFilters:
         if self.api_key:
             self._api_key_patterns.append(re.compile(re.escape(self.api_key)))
 
-    def add(self, fn):
-        self._filters.append(fn)
+    def add(self, filter_function):
+        self._filters.append(filter_function)
         return self
 
-    def apply(self, s):
-        if not s:
-            return s
-        out = s
-        for fn in self._filters:
-            out = fn(out)
+    def apply(self, text):
+        if not text:
+            return text
+        out = text
+        for filter_function in self._filters:
+            out = filter_function(out)
         return out
 
-    def apply_obj(self, o):
-        if o is None:
-            return o
-        if isinstance(o, str):
-            return self.apply(o)
-        if isinstance(o, list):
-            return [self.apply_obj(x) for x in o]
-        if isinstance(o, dict):
-            return {k: self.apply_obj(v) for k, v in o.items()}
-        return o
+    def apply_obj(self, obj):
+        if obj is None:
+            return obj
+        if isinstance(obj, str):
+            return self.apply(obj)
+        if isinstance(obj, list):
+            return [self.apply_obj(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: self.apply_obj(v) for k, v in obj.items()}
+        return obj
 
-    def _redact_sensitive_values(self, s):
-        out = s
-        for rx in self._api_key_patterns:
-            def _repl(m):
-                return (m.group(1) if m.lastindex else "") + "<REDACTED>"
-            out = rx.sub(_repl, out)
+    def _redact_sensitive_values(self, text):
+        out = text
+        for pattern in self._api_key_patterns:
+            def replace_match(match):
+                return (match.group(1) if match.lastindex else "") + "<REDACTED>"
+            out = pattern.sub(replace_match, out)
         return out
 
 
-def load_history(hist_path, m, filters):
+def load_history(history_path, max_entries, filters):
     rows = []
-    p = Path(hist_path)
-    if p.exists():
-        with p.open("r", encoding="utf-8", errors="replace") as f:
+    history_file = Path(history_path)
+    if history_file.exists():
+        with history_file.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -295,68 +311,82 @@ def load_history(hist_path, m, filters):
                     rows.append(filters.apply_obj(json.loads(line)))
                 except Exception:
                     continue
-    return rows[-m:]
+    return rows[-max_entries:]
 
 
-def append_history(hist_path, rec, filters):
-    p = Path(hist_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    safe = filters.apply_obj(rec)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(safe, ensure_ascii=False) + "\n")
+def append_history(history_path, record, filters):
+    history_file = Path(history_path)
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    safe_record = filters.apply_obj(record)
+    with history_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
 
 
-def build_ctx(hist_rows, filters):
-    ctx = []
-    for r in hist_rows:
-        q = (r.get("question") or "").strip()
-        h = (r.get("answer_human") or "").strip()
-        b = (r.get("answer_bash") or "").strip()
-        if q:
-            ctx.append({"role": "user", "content": q})
-        if h or b:
-            ctx.append({"role": "assistant", "content": ("HUMAN:\n" + h + "\n\nBASH:\n" + b).strip()})
-    return filters.apply_obj(ctx)
+def build_context_messages(init_capture, history_rows, current_notes, filters, line_count=None):
+    context_messages = []
+    init_text = (init_capture or "").strip()
+    if init_text:
+        prefix = "INIT TERMINAL CAPTURE"
+        if line_count:
+            prefix += f" (last {line_count} lines)"
+        context_messages.append({"role": "user", "content": f"{prefix}:\n{init_text}"})
+    for row in history_rows:
+        notes_text = str(row.get("notes") or "").strip()
+        commands_raw = row.get("comands") or row.get("commands")
+        commands = commands_raw if isinstance(commands_raw, dict) else {}
+        bash_text = (commands.get("bash") or row.get("answer_bash") or "").strip()
+        preview_text = (commands.get("preview") or row.get("cropped_preview") or "").strip()
+        human_text = (row.get("answer") or row.get("answer_human") or "").strip()
+        parts = []
+        if notes_text or bash_text or preview_text:
+            parts.append("NOTES:\n" + (notes_text if notes_text else "(none)"))
+        if bash_text:
+            parts.append("BASH:\n" + bash_text)
+            parts.append("RESULT:\n" + preview_text)
+        elif preview_text:
+            parts.append("RESULT:\n" + preview_text)
+        block = "\n\n".join(parts).strip()
+        if block:
+            context_messages.append({"role": "user", "content": block})
+        if human_text:
+            context_messages.append({"role": "assistant", "content": "HUMAN:\n" + human_text})
+    notes_block = (current_notes or "").strip()
+    if notes_block:
+        context_messages.append({"role": "user", "content": "NOTES:\n" + notes_block})
+    return filters.apply_obj(context_messages)
 
 
-def call_model_blocking(api_key, model, pane_capture, notes, hist_path, m, paths, filters, instructions):
-    run_dir = paths["run"]
-    human_path = str(run_dir / "human.txt")
-    bash_path = str(run_dir / "bash.sh")
-    hist_rows = load_history(hist_path, m, filters)
-    ctx = build_ctx(hist_rows, filters)
-    cap_s = filters.apply(pane_capture)
-    notes_s = filters.apply(notes)
-    user_in = "TERMINAL OUTPUT:\n" + cap_s + "\n\nUSER NOTES:\n" + (notes_s if notes_s else "(none)") + "\n"
+def call_model_blocking(api_key, model, context, paths, filters, instructions):
+    run_directory = paths["run"]
+    human_path = str(run_directory / "human.txt")
+    bash_path = str(run_directory / "bash.sh")
     client = OpenAI(api_key=api_key)
-    resp = client.responses.create(model=model, instructions=instructions, input=ctx + [{"role": "user", "content": user_in}])
-    txt = (resp.output_text or "").replace("\r\n", "\n").strip() + "\n"
-    txt = filters.apply(txt)
-    mobj = re.search(r"(?s)^\s*HUMAN:\s*(.*?)\n\s*BASH:\s*(.*)\Z", txt)
+    response = client.responses.create(model=model, instructions=instructions, input=context)
+    raw_output = (response.output_text or "").replace("\r\n", "\n").strip() + "\n"
+    raw_output = filters.apply(raw_output)
+    parsed_sections = re.search(r"(?s)^\s*HUMAN:\s*(.*?)\n\s*BASH:\s*(.*)\Z", raw_output)
     human = ""
     bash = ""
-    if mobj:
-        human = mobj.group(1).strip() + "\n" if mobj.group(1).strip() else ""
-        bash = mobj.group(2)
+    if parsed_sections:
+        human = parsed_sections.group(1).strip() + "\n" if parsed_sections.group(1).strip() else ""
+        bash = parsed_sections.group(2)
     else:
-        human = "(FORMAT ERROR) RAW OUTPUT:\n" + txt
+        human = "(FORMAT ERROR) RAW OUTPUT:\n" + raw_output
         bash = ""
     write_file(human_path, human)
     write_file(bash_path, bash)
-    rec = {"ts": int(time.time()), "model": model, "question": user_in, "answer_human": human, "answer_bash": bash}
-    append_history(hist_path, rec, filters)
     return human, bash
 
 
 def tmux_paste_and_enter(pane_id, bash_text):
-    sh(["tmux", "send-keys", "-t", pane_id, "-l", bash_text], check=True)
+    run_command(["tmux", "send-keys", "-t", pane_id, "-l", bash_text], check=True)
     if not bash_text.endswith("\n"):
-        sh(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
+        run_command(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
 
 
-def capture_clean(pane_id, n_lines):
-    raw = sh(["tmux", "capture-pane", "-t", pane_id, "-pS", f"-{n_lines}"], check=True)
-    return strip_ansi(raw)
+def capture_clean(pane_id, line_count):
+    capture_text = run_command(["tmux", "capture-pane", "-t", pane_id, "-pS", f"-{line_count}"], check=True)
+    return strip_ansi(capture_text)
 
 
 async def run_tmux_llm():
@@ -368,135 +398,184 @@ async def run_tmux_llm():
         raise SystemExit("OPENAI_API_KEY is missing in environment")
     filters = TextFilters(api_key=api_key, patterns=config["filters"])
     model = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
-    pane_id = sh(["tmux", "display-message", "-p", "#{pane_id}"]).strip()
+    pane_id = run_command(["tmux", "display-message", "-p", "#{pane_id}"]).strip()
     if not pane_id:
         raise SystemExit("EMPTY PANE_ID")
-    run_dir = paths["run"]
-    hist_path = str(paths["hist"] / "history.jsonl")
-    cap_path = str(run_dir / "capture.txt")
-    notes_path = str(run_dir / "notes.txt")
-    human_path = str(run_dir / "human.txt")
-    bash_path = str(run_dir / "bash.sh")
+    run_directory = paths["run"]
+    history_path = str(paths["hist"] / "history.jsonl")
+    capture_path = str(run_directory / "capture.txt")
+    notes_path = str(run_directory / "notes.txt")
+    human_path = str(run_directory / "human.txt")
+    bash_path = str(run_directory / "bash.sh")
     ensure_empty_file(notes_path)
     ensure_empty_file(human_path)
     ensure_empty_file(bash_path)
-    n_lines = int(os.environ.get("TMUX_LLM_LINES", "400"))
-    m_turns = int(os.environ.get("TMUX_LLM_TURNS", "6"))
+    capture_line_limit = int(os.environ.get("TMUX_LLM_LINES", "100"))
+    max_history_turns = int(os.environ.get("TMUX_LLM_TURNS", "6"))
     logger.info(
         "tmux-llm session starting pane_id={} model={} lines={} turns={}",
         pane_id,
         model,
-        n_lines,
-        m_turns,
+        capture_line_limit,
+        max_history_turns,
     )
-    pane_capture = filters.apply(capture_clean(pane_id, n_lines))
-    write_file(cap_path, pane_capture)
+    init_capture = filters.apply(capture_clean(pane_id, capture_line_limit))
+    write_file(capture_path, init_capture)
+    session_state = {
+        "init_capture": init_capture,
+        "before_capture": init_capture,
+        "pending": None,
+    }
     style = Style.from_dict({"frame.border": "ansiblue", "title": "ansicyan bold"})
-    kb = KeyBindings()
+    key_bindings = KeyBindings()
     header = FormattedTextControl(text=[("class:title", "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F10/Esc: quit")])
-    status = FormattedTextControl(text=[("", "Ready.")])
+    status_bar = FormattedTextControl(text=[("", "Ready.")])
 
-    def set_status(s):
-        status.text = [("", s)]
+    def set_status(message):
+        status_bar.text = [("", message)]
 
-    preview = TextArea(text=(" %d lines from %s\n" % (n_lines, pane_id)) + pane_capture, read_only=True, scrollbar=True, wrap_lines=False)
-    notes = TextArea(text="", multiline=True, scrollbar=True, wrap_lines=True)
-    bash = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=False)
-    human = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=True)
-    sending = {"busy": False}
-    refreshing = {"busy": False}
-    w70 = Dimension(weight=7)
-    w30 = Dimension(weight=3)
-    top = VSplit([Frame(preview, title="Preview", width=w70), Frame(notes, title="Prompt", width=w30)])
-    bottom = VSplit([Frame(bash, title="BASH", width=w70), Frame(human, title="HUMAN", width=w30)])
-    container = HSplit([Window(header, height=1), top, bottom, Window(status, height=1)])
-    app = Application(layout=Layout(container, focused_element=notes), key_bindings=kb, full_screen=True, style=style)
+    preview_area = TextArea(
+        text=(" %d lines from %s\n" % (capture_line_limit, pane_id)) + init_capture, read_only=True, scrollbar=True, wrap_lines=False
+    )
+    notes_area = TextArea(text="", multiline=True, scrollbar=True, wrap_lines=True)
+    bash_area = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=False)
+    human_area = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=True)
+    send_state = {"busy": False}
+    refresh_state = {"busy": False}
+    primary_width_weight = Dimension(weight=7)
+    secondary_width_weight = Dimension(weight=3)
+    top_row = VSplit([Frame(preview_area, title="Preview", width=primary_width_weight), Frame(notes_area, title="Prompt", width=secondary_width_weight)])
+    bottom_row = VSplit([Frame(bash_area, title="BASH", width=primary_width_weight), Frame(human_area, title="HUMAN", width=secondary_width_weight)])
+    layout_container = HSplit([Window(header, height=1), top_row, bottom_row, Window(status_bar, height=1)])
+    application = Application(layout=Layout(layout_container, focused_element=notes_area), key_bindings=key_bindings, full_screen=True, style=style)
 
-    @kb.add("tab")
+    @key_bindings.add("tab")
     def _(event):
         event.app.layout.focus_next()
 
-    @kb.add("s-tab")
+    @key_bindings.add("s-tab")
     def _(event):
         event.app.layout.focus_previous()
 
-    async def refresh_preview_multi(delays):
-        if refreshing["busy"]:
+    async def refresh_preview_sequence(delays):
+        if refresh_state["busy"]:
             return
-        refreshing["busy"] = True
+        refresh_state["busy"] = True
         try:
             logger.info("Refreshing preview for pane {} with {} windows", pane_id, len(delays))
-            for d in delays:
-                await asyncio.sleep(d)
-                cap2 = filters.apply(capture_clean(pane_id, n_lines))
-                preview.text = ("=== PREVIEW (last %d lines from %s) ===\n" % (n_lines, pane_id)) + cap2
-                write_file(cap_path, cap2)
-                app.invalidate()
+            latest_capture = None
+            for delay_seconds in delays:
+                await asyncio.sleep(delay_seconds)
+                capture_snapshot = filters.apply(capture_clean(pane_id, capture_line_limit))
+                latest_capture = capture_snapshot
+                preview_area.text = ("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + capture_snapshot
+                write_file(capture_path, capture_snapshot)
+                application.invalidate()
+            if latest_capture is not None:
+                if session_state["pending"]:
+                    cropped_preview = compute_cropped_preview(session_state["pending"].get("before_capture"), latest_capture)
+                    record = {
+                        "ts": session_state["pending"]["ts"],
+                        "model": session_state["pending"]["model"],
+                        "notes": session_state["pending"]["notes"],
+                        "comands": {"bash": session_state["pending"]["bash"], "preview": cropped_preview},
+                        "answer": session_state["pending"]["human"],
+                    }
+                    append_history(history_path, record, filters)
+                    logger.info("History updated preview_len={} bash_len={}", len(cropped_preview), len(session_state["pending"]["bash"]))
+                    session_state["pending"] = None
             set_status("Preview refreshed.")
         except Exception as e:
             set_status(f"Preview refresh failed; see {log_path}.")
             log_exc("(REFRESH ERROR)", e)
         finally:
-            refreshing["busy"] = False
-            app.invalidate()
+            refresh_state["busy"] = False
+            application.invalidate()
 
-    async def do_send():
-        if sending["busy"]:
+    async def send_prompt():
+        if send_state["busy"]:
             return
-        sending["busy"] = True
-        notes_text = filters.apply(notes.text)
+        if session_state["pending"]:
+            set_status("Previous command not finished; wait for preview refresh.")
+            return
+        send_state["busy"] = True
+        notes_text = filters.apply(notes_area.text).strip()
+        if not notes_text:
+            notes_text = "(none)"
         write_file(notes_path, notes_text)
         set_status("Sending to model...")
-        app.invalidate()
+        application.invalidate()
         try:
-            loop = asyncio.get_running_loop()
-            logger.info("Sending prompt to model={} captured_lines={} notes_length={}", model, n_lines, len(notes_text))
-            h, b = await loop.run_in_executor(None, call_model_blocking, api_key, model, pane_capture, notes_text, hist_path, m_turns, paths, filters, config["instructions"])
-            human.text = h
-            bash.text = b
-            notes.text = ""
+            event_loop = asyncio.get_running_loop()
+            before_capture = filters.apply(capture_clean(pane_id, capture_line_limit))
+            session_state["before_capture"] = before_capture
+            history_rows = load_history(history_path, max_history_turns, filters)
+            context_messages = build_context_messages(
+                session_state["init_capture"], history_rows, notes_text, filters, line_count=capture_line_limit
+            )
+            logger.info("Sending prompt to model={} captured_lines={} notes_length={}", model, capture_line_limit, len(notes_text))
+            human_output, bash_output = await event_loop.run_in_executor(
+                None, call_model_blocking, api_key, model, context_messages, paths, filters, config["instructions"]
+            )
+            human_area.text = human_output
+            bash_area.text = bash_output
+            notes_area.text = ""
             write_file(notes_path, "")
-            set_status("Received. Press F6 to paste.")
-            logger.info("Model response received bash_len={} human_len={}", len(b), len(h))
+            logger.info("Model response received bash_len={} human_len={}", len(bash_output), len(human_output))
+            bash_trimmed = bash_output.strip()
+            human_trimmed = human_output.strip()
+            if bash_trimmed:
+                session_state["pending"] = {
+                    "notes": notes_text,
+                    "bash": bash_trimmed,
+                    "human": human_trimmed,
+                    "model": model,
+                    "ts": int(time.time()),
+                    "before_capture": before_capture,
+                }
+                set_status("Received. Press F6 to paste.")
+            else:
+                session_state["pending"] = None
+                set_status("Received. No BASH commands to paste.")
         except Exception as e:
-            et = "(MODEL ERROR)\n" + repr(e) + "\n\n" + traceback.format_exc()
-            et = filters.apply(et)
-            human.text = et
-            bash.text = ""
-            write_file(human_path, et)
+            error_text = "(MODEL ERROR)\n" + repr(e) + "\n\n" + traceback.format_exc()
+            error_text = filters.apply(error_text)
+            human_area.text = error_text
+            bash_area.text = ""
+            write_file(human_path, error_text)
             write_file(bash_path, "")
             set_status(f"Model error. See HUMAN / {log_path}.")
             log_exc("(MODEL ERROR)", e)
         finally:
-            sending["busy"] = False
-            app.invalidate()
+            send_state["busy"] = False
+            application.invalidate()
 
-    @kb.add("f5")
+    @key_bindings.add("f5")
     def _(event):
-        asyncio.create_task(do_send())
+        asyncio.create_task(send_prompt())
 
-    @kb.add("f6")
+    @key_bindings.add("f6")
     def _(event):
-        bt = bash.text
-        if not bt.strip():
+        bash_text_content = bash_area.text
+        if not bash_text_content.strip():
             set_status("BASH is empty; nothing to paste.")
             logger.warning("Paste requested with empty BASH output for pane {}", pane_id)
             return
         try:
-            tmux_paste_and_enter(pane_id, bt)
+            tmux_paste_and_enter(pane_id, bash_text_content)
             set_status(f"Pasted+Enter into {pane_id}. Refreshing preview...")
             logger.info("Pasted model output into pane {}", pane_id)
-            asyncio.create_task(refresh_preview_multi([0.15, 0.6, 1.5, 2.5, 3.5]))
+            asyncio.create_task(refresh_preview_sequence([0.15, 0.6, 1.5, 2.5, 3.5]))
         except Exception as e:
             set_status(f"Paste failed; see {log_path}.")
             log_exc("(PASTE ERROR)", e)
 
-    @kb.add("f10")
-    @kb.add("escape")
+    @key_bindings.add("f10")
+    @key_bindings.add("escape")
     def _(event):
         event.app.exit(result=0)
 
-    return await app.run_async()
+    return await application.run_async()
 
 
 def main():
@@ -508,10 +587,10 @@ def main():
         try:
             paths = resolve_paths("tmux-llm")
             try:
-                cfg = load_config()
+                config = load_config()
             except Exception:
-                cfg = None
-            logger, log_path, log_exc = open_log(paths, (cfg or {}).get("logging"))
+                config = None
+            logger, log_path, log_exc = open_log(paths, (config or {}).get("logging"))
             log_exc("(FATAL)", e)
         except Exception:
             pass
@@ -520,9 +599,10 @@ def main():
 
 __all__ = [
     "append_history",
-    "build_ctx",
+    "build_context_messages",
     "call_model_blocking",
     "capture_clean",
+    "compute_cropped_preview",
     "ensure_empty_file",
     "load_config",
     "load_history",
