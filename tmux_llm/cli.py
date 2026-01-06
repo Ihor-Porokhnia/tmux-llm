@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from loguru import logger as log
 from openai import OpenAI
 from prompt_toolkit.application import Application
+from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window
@@ -40,11 +41,16 @@ DEFAULT_INSTRUCTIONS = dedent(
     The HUMAN block is for the human operator only, MUST be written in Russian, and MUST NOT be pasted into the terminal.
     The BASH block MUST be safe-to-paste and executable in a bash shell as-is: ONLY bash code and shell commands, NO Markdown, NO explanations, NO numbering, NO prompt symbols, NO surrounding backticks.
     Work ONE STEP AT A TIME: each response must contain a single next action consisting of either (a) minimal diagnostic commands to collect information needed for the next decision, or (b) one minimal corrective change with commands to apply it.
+    Work ONE STEP AT A TIME: each response must contain a single next action consisting of either (a) minimal diagnostic commands to collect information needed for the next decision, or (b) one minimal corrective change with commands to apply it.
     Diagnostic command execution is allowed and encouraged.
-    If a helper script must be written to a file from bash (via heredoc or echo), then immediately after writing the script inside the BASH block you MUST include, in subsequent lines of the same BASH block: (1) a command that makes the script executable, (2) a command that runs the script, and (3) ensure that the script itself prints its result to STDOUT so that its execution output is shown on the console, (4) remove the script file right after execution.
-    If absolutely no commands are needed, leave the BASH block empty.
+    When providing Bash solutions or diagnostics, you must output only valid Bash one-liners with inline conditional logic, or write a script to a file and execute it exactly in this order within the same Bash block: (1) write the script to a file, (2) make it executable, (3) run it. The application will directly stream your Bash block to the console and will not save or wrap multi-line scripts unless written to a file as specified. Do not return standalone multi-line Bash script text without the file-write and execute sequence.
+    If writing a script to a file (via heredoc or echo), the Bash block must include immediately after the script content: a command to chmod +x the file, a command to execute the file, and the script must print its result to STDOUT.
+    Ensure the Bash block contains no line breaks inside script commands except where delimiting file-write content from execution commands.
+    If absolutely no commands are needed, the BASH block must contain only the word: false
     Do not provide multiple alternative branches in one response; choose the single most likely next step.
     Commands in BASH must not emit user-facing reports by default.
+    If additional information from the user is required, or you have doubts about the correctness or logic of the current process, ask all necessary questions in Russian. You may ask multiple questions at once. In this case, the BASH block must contain only the word: false
+    Use false in the BASH block whenever it would otherwise be empty in the described circumstances, including cases where no commands are needed due to missing user input or required clarification.
     When a command may produce excessively large output, it is allowed to apply filtering, truncation, or structured marking to keep the output within reasonable bounds for model processing.
     Formatting or marking of truncated/filtered output is permitted to preserve structure.
     BASH may include creating files and executing them, but must remain runnable without manual editing unless explicitly unavoidable; if unavoidable, mark assumptions in HUMAN and keep BASH runnable.
@@ -63,6 +69,15 @@ DEFAULT_LOGGING_CONFIG = {
     "stderr": True,
 }
 
+HISTORY_COMPRESSION_INSTRUCTIONS = dedent(
+    """
+    You compress application history blocks. The user provides history blocks ordered from oldest to newest.
+    Each block may contain NOTES, BASH, RESULT, and HUMAN sections and represents requests, actions and advice for solving the problem..
+    Produce a concise logical summary that preserves key actions, results, and causal links.
+    Return only the summary text, no lists, headers, or code.
+    """
+).strip()
+
 
 def run_command(args, input_text=None, check=True):
     process = subprocess.run(args, input=input_text, text=True, capture_output=True)
@@ -75,6 +90,10 @@ def run_command(args, input_text=None, check=True):
 
 def strip_ansi(text):
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+
+
+def strip_empty_lines(text):
+    return "\n".join(line for line in (text or "").splitlines() if line.strip())
 
 
 def compute_cropped_preview(before, after):
@@ -95,15 +114,9 @@ def compute_cropped_preview(before, after):
 def strip_prompt_prefix(line):
     if line is None:
         return "", False
-    prompt_patterns = [
-        re.compile(r"^\s*(?:\[[^\]]+\]\s*)?(?:[^\s@]+@)?[^\s:]+:[^\s]*[$#]\s*"),
-        re.compile(r"^\s*[A-Za-z]:[^\n>]*>\s*"),
-        re.compile(r"^\s*[#$%>]\s+"),
-    ]
-    for pattern in prompt_patterns:
-        match = pattern.match(line)
-        if match:
-            return line[match.end():], True
+    match = re.match(r"^\s*.*?[#$%>➜❯]\s+", line or "")
+    if match:
+        return line[match.end():], True
     return line, False
 
 
@@ -380,6 +393,55 @@ def append_history(history_path, record, filters):
         f.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
 
 
+def rewrite_history(history_path, records, filters, sanitize=False):
+    history_file = Path(history_path)
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for record in records:
+        normalized = normalize_history_row(record, sanitize=sanitize)
+        if normalized is None:
+            continue
+        safe_record = filters.apply_obj(normalized)
+        lines.append(json.dumps(safe_record, ensure_ascii=False))
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    history_file.write_text(content, encoding="utf-8")
+
+
+def format_history_blocks_for_summary(blocks):
+    def cleaned(value):
+        text = str(value or "").strip()
+        return "" if text.lower() == "false" else text
+    rendered = []
+    for idx, row in enumerate(blocks, 1):
+        notes_text = cleaned(row.get("notes"))
+        bash_text = cleaned(row.get("bash"))
+        preview_text = cleaned(row.get("preview"))
+        answer_text = cleaned(row.get("answer"))
+        parts = [f"BLOCK {idx}:"]
+        if notes_text:
+            parts.append(f"NOTES: {notes_text}")
+        if bash_text:
+            parts.append(f"BASH: {bash_text}")
+        if preview_text:
+            parts.append(f"RESULT: {preview_text}")
+        if answer_text:
+            parts.append(f"HUMAN: {answer_text}")
+        rendered.append("\n".join(parts))
+    return "\n\n".join(rendered).strip()
+
+
+def summarize_history(api_key, model, blocks_text):
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=model,
+        instructions=HISTORY_COMPRESSION_INSTRUCTIONS,
+        input=[{"role": "user", "content": blocks_text}],
+    )
+    return (response.output_text or "").replace("\r\n", "\n").strip()
+
+
 def build_context_messages(init_capture, history_rows, current_notes, filters, line_count=None):
     context_messages = []
     init_text = (init_capture or "").strip()
@@ -468,6 +530,8 @@ async def run_tmux_llm():
     ensure_empty_file(bash_path)
     capture_line_limit = int(os.environ.get("TMUX_LLM_LINES", "100"))
     max_history_turns = int(os.environ.get("TMUX_LLM_TURNS", "6"))
+    long_refresh_timeout = float(os.environ.get("TMUX_LLM_PREVIEW_MAX_WAIT", "30"))
+    long_refresh_interval = float(os.environ.get("TMUX_LLM_PREVIEW_POLL", "1.5"))
     logger.info(
         "tmux-llm session starting pane_id={} model={} lines={} turns={}",
         pane_id,
@@ -489,7 +553,7 @@ async def run_tmux_llm():
         text=[
             (
                 "class:title",
-                "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F7: reset history | F8: clear term ctx | F10/Esc: quit",
+                "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F7: reset history | F8: clear term ctx | F9: compress history | F10/Esc: quit",
             )
         ]
     )
@@ -498,9 +562,8 @@ async def run_tmux_llm():
     def set_status(message):
         status_bar.text = [("", message)]
 
-    preview_area = TextArea(
-        text=(" %d lines from %s\n" % (capture_line_limit, pane_id)) + init_capture, read_only=True, scrollbar=True, wrap_lines=False
-    )
+    initial_preview_text = (" %d lines from %s\n" % (capture_line_limit, pane_id)) + init_capture
+    preview_area = TextArea(text=initial_preview_text, read_only=True, scrollbar=True, wrap_lines=False)
     notes_area = TextArea(text="", multiline=True, scrollbar=True, wrap_lines=True)
     bash_area = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=False)
     human_area = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=True)
@@ -512,6 +575,31 @@ async def run_tmux_llm():
     bottom_row = VSplit([Frame(bash_area, title="BASH", width=primary_width_weight), Frame(human_area, title="HUMAN", width=secondary_width_weight)])
     layout_container = HSplit([Window(header, height=1), top_row, bottom_row, Window(status_bar, height=1)])
     application = Application(layout=Layout(layout_container, focused_element=notes_area), key_bindings=key_bindings, full_screen=True, style=style)
+
+    def update_preview(text):
+        """Set preview text and keep viewport pinned to the newest lines."""
+        render_text = text.rstrip("\r\n ") if text else ""
+        document = Document(render_text, cursor_position=len(render_text))
+        preview_area.buffer.set_document(document, bypass_readonly=True)
+        buffer_text = preview_area.buffer.text
+        buffer_lines = len(buffer_text.splitlines()) if buffer_text else 0
+        cursor_pos = preview_area.buffer.cursor_position
+        try:
+            first_line = render_text.splitlines()[0] if render_text else ""
+        except Exception:
+            first_line = "<unreadable>"
+        logger.debug(
+            "update_preview: render_chars={} render_lines={} buffer_chars={} buffer_lines={} cursor={} first_line={!r}",
+            len(render_text),
+            len(render_text.splitlines()) if render_text else 0,
+            len(buffer_text),
+            buffer_lines,
+            cursor_pos,
+            first_line,
+        )
+        application.invalidate()
+
+    update_preview(initial_preview_text)
 
     @key_bindings.add("tab")
     def _(event):
@@ -539,9 +627,34 @@ async def run_tmux_llm():
         except Exception:
             line_target = max(line_target * 2, line_target + 500)
         capture_text = filters.apply(capture_clean(pane_id, line_target))
+        logger.debug(
+            "capture_full_context: captured chars={} lines={} target={}",
+            len(capture_text),
+            len(capture_text.splitlines()),
+            line_target,
+        )
         actual_lines = len(capture_text.splitlines())
         new_limit = max(line_target, actual_lines)
         return capture_text, new_limit
+
+    def extract_prompt_line(capture_text):
+        lines = capture_text.splitlines()
+        return lines[-1] if lines else ""
+
+    def prompt_returned(capture_text):
+        pending = session_state.get("pending")
+        if not pending:
+            return False
+        prompt_line = pending.get("prompt_line") or ""
+        # logger.info("prompt_line {}", prompt_line)
+        if not prompt_line:
+            return False
+        lines = strip_empty_lines(capture_text).splitlines()
+        #logger.info("lines {}", lines)
+        if not lines:
+            return False
+        #logger.info("lines[-1] {}", lines[-1])    
+        return lines[-1] == prompt_line
 
     async def clear_history_and_refresh_context():
         nonlocal capture_line_limit
@@ -551,6 +664,7 @@ async def run_tmux_llm():
         if refresh_state["busy"]:
             set_status("Preview refresh in progress; try again momentarily.")
             return
+        logger.debug("clear_history_and_refresh_context: start limit={}", capture_line_limit)
         set_status("Clearing history and capturing full terminal...")
         application.invalidate()
         try:
@@ -561,7 +675,13 @@ async def run_tmux_llm():
             capture_line_limit = new_limit
             session_state["init_capture"] = full_capture
             session_state["before_capture"] = full_capture
-            preview_area.text = ("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + full_capture
+            update_preview(("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + full_capture)
+            logger.debug(
+                "clear_history_and_refresh_context: preview chars={} lines={} limit={}",
+                len(full_capture),
+                len(full_capture.splitlines()),
+                capture_line_limit,
+            )
             write_file(capture_path, full_capture)
             notes_area.text = ""
             bash_area.text = ""
@@ -581,6 +701,7 @@ async def run_tmux_llm():
         if refresh_state["busy"]:
             set_status("Preview refresh in progress; try again momentarily.")
             return
+        logger.debug("clear_terminal_context_only: start limit={}", capture_line_limit)
         set_status("Clearing terminal context...")
         application.invalidate()
         try:
@@ -590,7 +711,12 @@ async def run_tmux_llm():
             session_state["pending"] = None
             session_state["before_capture"] = baseline_capture
             ensure_empty_file(capture_path)
-            preview_area.text = "=== TERMINAL CONTEXT CLEARED ===\nOld terminal output will be ignored for the next context."
+            update_preview("=== TERMINAL CONTEXT CLEARED ===\nOld terminal output will be ignored for the next context.")
+            logger.debug(
+                "clear_terminal_context_only: baseline chars={} lines={}",
+                len(baseline_capture),
+                len(baseline_capture.splitlines()),
+            )
             set_status("Terminal context cleared. New context starts now.")
             logger.info("Terminal context cleared baseline_len={} limit={}", len(baseline_capture), capture_line_limit)
         except Exception as e:
@@ -604,35 +730,149 @@ async def run_tmux_llm():
             return
         refresh_state["busy"] = True
         try:
-            logger.info("Refreshing preview for pane {} with {} windows", pane_id, len(delays))
+            logger.debug(
+                "refresh_preview_sequence: start delays={} pending={} pending_prompt={}",
+                delays,
+                bool(session_state.get("pending")),
+                (session_state.get("pending") or {}).get("prompt_line"),
+            )
+            logger.info(
+                "Refreshing preview for pane {} with {} quick polls and tail up to {}s",
+                pane_id,
+                len(delays),
+                long_refresh_timeout,
+            )
+            start_time = time.time()
+            prompt_seen = False
             latest_capture = None
-            for delay_seconds in delays:
-                await asyncio.sleep(delay_seconds)
+            waiting_for_prompt = False
+
+            def capture_and_render():
                 capture_snapshot = filters.apply(capture_clean(pane_id, capture_line_limit))
-                latest_capture = capture_snapshot
-                preview_area.text = ("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + capture_snapshot
+                update_preview(("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + capture_snapshot)
+                logger.debug(
+                    "capture_and_render: chars={} lines={} capture_limit={}",
+                    len(capture_snapshot),
+                    len(capture_snapshot.splitlines()),
+                    capture_line_limit,
+                )
                 write_file(capture_path, capture_snapshot)
                 application.invalidate()
-            if latest_capture is not None:
-                if session_state["pending"]:
-                    cropped_preview = compute_cropped_preview(session_state["pending"].get("before_capture"), latest_capture)
-                    record = {
-                        "ts": session_state["pending"]["ts"],
-                        "model": session_state["pending"]["model"],
-                        "notes": session_state["pending"]["notes"],
-                        "bash": session_state["pending"]["bash"],
-                        "preview": cropped_preview,
-                        "answer": session_state["pending"]["human"],
-                    }
-                    append_history(history_path, record, filters)
-                    logger.info("History updated preview_len={} bash_len={}", len(cropped_preview), len(session_state["pending"]["bash"]))
-                    session_state["pending"] = None
-            set_status("Preview refreshed.")
+                return capture_snapshot
+
+            for delay_seconds in delays:
+                await asyncio.sleep(delay_seconds)
+                capture_snapshot = capture_and_render()
+                latest_capture = capture_snapshot
+                prompt_seen = prompt_returned(capture_snapshot)
+                if prompt_seen:
+                    logger.info("Prompt detected during quick preview refresh for pane {}", pane_id)
+                    break
+
+            if session_state["pending"] and not prompt_seen:
+                waiting_for_prompt = True
+                set_status("Waiting for command to finish...")
+
+            while (
+                session_state["pending"]
+                and not prompt_seen
+                and (time.time() - start_time) < long_refresh_timeout
+            ):
+                await asyncio.sleep(long_refresh_interval)
+                capture_snapshot = capture_and_render()
+                latest_capture = capture_snapshot
+                prompt_seen = prompt_returned(capture_snapshot)
+
+            if latest_capture is not None and session_state["pending"]:
+                cropped_preview = compute_cropped_preview(session_state["pending"].get("before_capture"), latest_capture)
+                record = {
+                    "ts": session_state["pending"]["ts"],
+                    "model": session_state["pending"]["model"],
+                    "notes": session_state["pending"]["notes"],
+                    "bash": session_state["pending"]["bash"],
+                    "preview": cropped_preview,
+                    "answer": session_state["pending"]["human"],
+                }
+                append_history(history_path, record, filters)
+                logger.info(
+                    "History updated preview_len={} bash_len={} prompt_seen={} waited_sec={:.1f}",
+                    len(cropped_preview),
+                    len(session_state["pending"]["bash"]),
+                    prompt_seen,
+                    time.time() - start_time,
+                )
+                session_state["pending"] = None
+            if prompt_seen:
+                set_status("Preview refreshed (command finished).")
+            elif waiting_for_prompt:
+                set_status("Preview refreshed (timeout waiting for prompt).")
+            else:
+                set_status("Preview refreshed.")
+            logger.debug(
+                "refresh_preview_sequence: done prompt_seen={} waited_sec={:.2f} pending_after={}",
+                prompt_seen,
+                time.time() - start_time,
+                bool(session_state.get("pending")),
+            )
         except Exception as e:
             set_status(f"Preview refresh failed; see {log_path}.")
             log_exc("(REFRESH ERROR)", e)
         finally:
             refresh_state["busy"] = False
+            application.invalidate()
+
+    async def compress_history_blocks():
+        if send_state["busy"]:
+            set_status("Wait for send to finish before compressing history.")
+            return
+        if refresh_state["busy"]:
+            set_status("Preview refresh in progress; try again momentarily.")
+            return
+        if session_state["pending"]:
+            set_status("Pending preview refresh; wait before compressing.")
+            return
+        set_status("Compressing history...")
+        application.invalidate()
+        try:
+            max_rows = 1_000_000
+            history_rows = load_history(history_path, max_rows, filters)
+            total_rows = len(history_rows)
+            if total_rows < 2:
+                set_status("Not enough history to compress.")
+                return
+            compress_count = total_rows // 2
+            target_rows = history_rows[:compress_count]
+            remaining_rows = history_rows[compress_count:]
+            blocks_text = format_history_blocks_for_summary(target_rows)
+            if not blocks_text:
+                set_status("No history content to compress.")
+                return
+            event_loop = asyncio.get_running_loop()
+            summary_text = await event_loop.run_in_executor(None, summarize_history, api_key, model, blocks_text)
+            summary_text = filters.apply(summary_text).strip()
+            if not summary_text:
+                set_status("Compression failed: empty summary.")
+                return
+            summary_record = {
+                "ts": int(time.time()),
+                "model": model,
+                "notes": summary_text,
+                "bash": "false",
+                "preview": "false",
+                "answer": "false",
+            }
+            rewrite_history(history_path, [summary_record] + remaining_rows, filters)
+            set_status(f"History compressed: {compress_count} blocks replaced with 1.")
+            logger.info(
+                "History compressed replaced {} of {} entries with summary length={}",
+                compress_count,
+                total_rows,
+                len(summary_text),
+            )
+        except Exception as e:
+            set_status(f"History compression failed; see {log_path}.")
+            log_exc("(HISTORY COMPRESSION ERROR)", e)
+        finally:
             application.invalidate()
 
     async def send_prompt():
@@ -651,6 +891,8 @@ async def run_tmux_llm():
         try:
             event_loop = asyncio.get_running_loop()
             before_capture = filters.apply(capture_clean(pane_id, capture_line_limit))
+            before_capture = strip_empty_lines(before_capture)
+            logger.info("before_capture {}", before_capture)
             session_state["before_capture"] = before_capture
             init_capture_for_context = compute_init_context(before_capture)
             history_rows = load_history(history_path, max_history_turns, filters)
@@ -669,6 +911,8 @@ async def run_tmux_llm():
             bash_trimmed = bash_output.strip()
             human_trimmed = human_output.strip()
             if bash_trimmed:
+                prompt_line = extract_prompt_line(before_capture)
+                logger.info("prompt_line {}", prompt_line)
                 session_state["pending"] = {
                     "notes": notes_text,
                     "bash": bash_trimmed,
@@ -676,6 +920,7 @@ async def run_tmux_llm():
                     "model": model,
                     "ts": int(time.time()),
                     "before_capture": before_capture,
+                    "prompt_line": prompt_line,
                 }
                 set_status("Received. Press F6 to paste.")
             else:
@@ -721,6 +966,10 @@ async def run_tmux_llm():
     @key_bindings.add("f8")
     def _(event):
         asyncio.create_task(clear_terminal_context_only())
+
+    @key_bindings.add("f9")
+    def _(event):
+        asyncio.create_task(compress_history_blocks())
 
     @key_bindings.add("f10")
     @key_bindings.add("escape")
