@@ -92,6 +92,57 @@ def compute_cropped_preview(before, after):
     return "\n".join(new_lines).strip("\n")
 
 
+def strip_prompt_prefix(line):
+    if line is None:
+        return "", False
+    prompt_patterns = [
+        re.compile(r"^\s*(?:\[[^\]]+\]\s*)?(?:[^\s@]+@)?[^\s:]+:[^\s]*[$#]\s*"),
+        re.compile(r"^\s*[A-Za-z]:[^\n>]*>\s*"),
+        re.compile(r"^\s*[#$%>]\s+"),
+    ]
+    for pattern in prompt_patterns:
+        match = pattern.match(line)
+        if match:
+            return line[match.end():], True
+    return line, False
+
+
+def sanitize_preview(preview_text, bash_text):
+    if not preview_text:
+        return ""
+    commands = [cmd.strip() for cmd in (bash_text or "").splitlines() if cmd.strip()]
+    sanitized_lines = []
+    for raw_line in preview_text.splitlines():
+        line, had_prompt = strip_prompt_prefix(raw_line)
+        normalized = line.strip()
+        if commands and any(normalized == cmd or normalized.startswith(cmd + " ") for cmd in commands):
+            continue
+        if had_prompt and not normalized:
+            continue
+        if not normalized:
+            continue
+        sanitized_lines.append(line)
+    return "\n".join(sanitized_lines).strip("\n")
+
+
+def normalize_history_row(row, sanitize=False):
+    if not isinstance(row, dict) or "bash" not in row:
+        return None
+    bash = row.get("bash") or ""
+    preview = row.get("preview") or ""
+    normalized = {
+        "ts": row.get("ts"),
+        "model": row.get("model") or "",
+        "notes": row.get("notes") or "",
+        "bash": str(bash) if bash is not None else "",
+        "preview": str(preview) if preview is not None else "",
+        "answer": str(row.get("answer") or ""),
+    }
+    if sanitize:
+        normalized["preview"] = sanitize_preview(normalized["preview"], normalized["bash"])
+    return normalized
+
+
 def write_file(path, content):
     Path(path).write_text(content, encoding="utf-8")
 
@@ -308,7 +359,11 @@ def load_history(history_path, max_entries, filters):
                 if not line:
                     continue
                 try:
-                    rows.append(filters.apply_obj(json.loads(line)))
+                    parsed_row = json.loads(line)
+                    normalized = normalize_history_row(parsed_row, sanitize=True)
+                    if normalized is None:
+                        continue
+                    rows.append(filters.apply_obj(normalized))
                 except Exception:
                     continue
     return rows[-max_entries:]
@@ -317,7 +372,10 @@ def load_history(history_path, max_entries, filters):
 def append_history(history_path, record, filters):
     history_file = Path(history_path)
     history_file.parent.mkdir(parents=True, exist_ok=True)
-    safe_record = filters.apply_obj(record)
+    normalized_record = normalize_history_row(record, sanitize=True)
+    if normalized_record is None:
+        return
+    safe_record = filters.apply_obj(normalized_record)
     with history_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
 
@@ -332,11 +390,9 @@ def build_context_messages(init_capture, history_rows, current_notes, filters, l
         context_messages.append({"role": "user", "content": f"{prefix}:\n{init_text}"})
     for row in history_rows:
         notes_text = str(row.get("notes") or "").strip()
-        commands_raw = row.get("comands") or row.get("commands")
-        commands = commands_raw if isinstance(commands_raw, dict) else {}
-        bash_text = (commands.get("bash") or row.get("answer_bash") or "").strip()
-        preview_text = (commands.get("preview") or row.get("cropped_preview") or "").strip()
-        human_text = (row.get("answer") or row.get("answer_human") or "").strip()
+        bash_text = str(row.get("bash") or "").strip()
+        preview_text = str(row.get("preview") or "").strip()
+        human_text = str(row.get("answer") or "").strip()
         parts = []
         if notes_text or bash_text or preview_text:
             parts.append("NOTES:\n" + (notes_text if notes_text else "(none)"))
@@ -425,10 +481,18 @@ async def run_tmux_llm():
         "init_capture": init_capture,
         "before_capture": init_capture,
         "pending": None,
+        "context_baseline": None,
     }
     style = Style.from_dict({"frame.border": "ansiblue", "title": "ansicyan bold"})
     key_bindings = KeyBindings()
-    header = FormattedTextControl(text=[("class:title", "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F10/Esc: quit")])
+    header = FormattedTextControl(
+        text=[
+            (
+                "class:title",
+                "tmux-llm | Tab/Shift-Tab: focus | F5: send | F6: paste | F7: reset history | F8: clear term ctx | F10/Esc: quit",
+            )
+        ]
+    )
     status_bar = FormattedTextControl(text=[("", "Ready.")])
 
     def set_status(message):
@@ -457,6 +521,84 @@ async def run_tmux_llm():
     def _(event):
         event.app.layout.focus_previous()
 
+    def compute_init_context(latest_capture):
+        baseline = session_state.get("context_baseline")
+        if baseline is not None:
+            return compute_cropped_preview(baseline, latest_capture)
+        return session_state["init_capture"]
+
+    def capture_full_context():
+        line_target = capture_line_limit
+        try:
+            history_size_raw = run_command(["tmux", "display-message", "-p", "#{history_size}"]).strip()
+            pane_height_raw = run_command(["tmux", "display-message", "-p", "#{pane_height}"]).strip()
+            history_size = int(history_size_raw or "0")
+            pane_height = int(pane_height_raw or "0")
+            if history_size >= 0 and pane_height >= 0:
+                line_target = max(line_target, history_size + pane_height)
+        except Exception:
+            line_target = max(line_target * 2, line_target + 500)
+        capture_text = filters.apply(capture_clean(pane_id, line_target))
+        actual_lines = len(capture_text.splitlines())
+        new_limit = max(line_target, actual_lines)
+        return capture_text, new_limit
+
+    async def clear_history_and_refresh_context():
+        nonlocal capture_line_limit
+        if send_state["busy"]:
+            set_status("Wait for send to finish before clearing history.")
+            return
+        if refresh_state["busy"]:
+            set_status("Preview refresh in progress; try again momentarily.")
+            return
+        set_status("Clearing history and capturing full terminal...")
+        application.invalidate()
+        try:
+            ensure_empty_file(history_path)
+            session_state["pending"] = None
+            session_state["context_baseline"] = None
+            full_capture, new_limit = await asyncio.to_thread(capture_full_context)
+            capture_line_limit = new_limit
+            session_state["init_capture"] = full_capture
+            session_state["before_capture"] = full_capture
+            preview_area.text = ("=== PREVIEW (last %d lines from %s) ===\n" % (capture_line_limit, pane_id)) + full_capture
+            write_file(capture_path, full_capture)
+            notes_area.text = ""
+            bash_area.text = ""
+            human_area.text = ""
+            set_status(f"History cleared; using {capture_line_limit} lines from terminal.")
+            logger.info("History cleared and recaptured terminal capture_len={} new_limit={}", len(full_capture), capture_line_limit)
+        except Exception as e:
+            set_status(f"History clear failed; see {log_path}.")
+            log_exc("(HISTORY CLEAR ERROR)", e)
+        finally:
+            application.invalidate()
+
+    async def clear_terminal_context_only():
+        if send_state["busy"]:
+            set_status("Wait for send to finish before clearing terminal context.")
+            return
+        if refresh_state["busy"]:
+            set_status("Preview refresh in progress; try again momentarily.")
+            return
+        set_status("Clearing terminal context...")
+        application.invalidate()
+        try:
+            baseline_capture = await asyncio.to_thread(lambda: filters.apply(capture_clean(pane_id, capture_line_limit)))
+            session_state["context_baseline"] = baseline_capture
+            session_state["init_capture"] = ""
+            session_state["pending"] = None
+            session_state["before_capture"] = baseline_capture
+            ensure_empty_file(capture_path)
+            preview_area.text = "=== TERMINAL CONTEXT CLEARED ===\nOld terminal output will be ignored for the next context."
+            set_status("Terminal context cleared. New context starts now.")
+            logger.info("Terminal context cleared baseline_len={} limit={}", len(baseline_capture), capture_line_limit)
+        except Exception as e:
+            set_status(f"Terminal clear failed; see {log_path}.")
+            log_exc("(TERMINAL CLEAR ERROR)", e)
+        finally:
+            application.invalidate()
+
     async def refresh_preview_sequence(delays):
         if refresh_state["busy"]:
             return
@@ -478,7 +620,8 @@ async def run_tmux_llm():
                         "ts": session_state["pending"]["ts"],
                         "model": session_state["pending"]["model"],
                         "notes": session_state["pending"]["notes"],
-                        "comands": {"bash": session_state["pending"]["bash"], "preview": cropped_preview},
+                        "bash": session_state["pending"]["bash"],
+                        "preview": cropped_preview,
                         "answer": session_state["pending"]["human"],
                     }
                     append_history(history_path, record, filters)
@@ -509,9 +652,10 @@ async def run_tmux_llm():
             event_loop = asyncio.get_running_loop()
             before_capture = filters.apply(capture_clean(pane_id, capture_line_limit))
             session_state["before_capture"] = before_capture
+            init_capture_for_context = compute_init_context(before_capture)
             history_rows = load_history(history_path, max_history_turns, filters)
             context_messages = build_context_messages(
-                session_state["init_capture"], history_rows, notes_text, filters, line_count=capture_line_limit
+                init_capture_for_context, history_rows, notes_text, filters, line_count=capture_line_limit
             )
             logger.info("Sending prompt to model={} captured_lines={} notes_length={}", model, capture_line_limit, len(notes_text))
             human_output, bash_output = await event_loop.run_in_executor(
@@ -569,6 +713,14 @@ async def run_tmux_llm():
         except Exception as e:
             set_status(f"Paste failed; see {log_path}.")
             log_exc("(PASTE ERROR)", e)
+
+    @key_bindings.add("f7")
+    def _(event):
+        asyncio.create_task(clear_history_and_refresh_context())
+
+    @key_bindings.add("f8")
+    def _(event):
+        asyncio.create_task(clear_terminal_context_only())
 
     @key_bindings.add("f10")
     @key_bindings.add("escape")
