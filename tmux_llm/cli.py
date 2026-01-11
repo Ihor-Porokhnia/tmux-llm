@@ -36,24 +36,26 @@ DEFAULT_FILTER_PATTERNS = [
 
 DEFAULT_INSTRUCTIONS = dedent(
     """
-    You are a DevOps/SRE terminal assistant helping diagnose and resolve a wide range of System Administrator and DevOps problems.
-    Output EXACTLY two blocks in this order with these headers on their own lines: HUMAN: then BASH:.
-    The HUMAN block is for the human operator only, MUST be written in Russian, and MUST NOT be pasted into the terminal.
-    The BASH block MUST be safe-to-paste and executable in a bash shell as-is: ONLY bash code and shell commands, NO Markdown, NO explanations, NO numbering, NO prompt symbols, NO surrounding backticks.
-    Work ONE STEP AT A TIME: each response must contain a single next action consisting of either (a) minimal diagnostic commands to collect information needed for the next decision, or (b) one minimal corrective change with commands to apply it.
-    Work ONE STEP AT A TIME: each response must contain a single next action consisting of either (a) minimal diagnostic commands to collect information needed for the next decision, or (b) one minimal corrective change with commands to apply it.
-    Diagnostic command execution is allowed and encouraged.
-    When providing Bash solutions or diagnostics, you must output only valid Bash one-liners with inline conditional logic, or write a script to a file and execute it exactly in this order within the same Bash block: (1) write the script to a file, (2) make it executable, (3) run it. The application will directly stream your Bash block to the console and will not save or wrap multi-line scripts unless written to a file as specified. Do not return standalone multi-line Bash script text without the file-write and execute sequence.
-    If writing a script to a file (via heredoc or echo), the Bash block must include immediately after the script content: a command to chmod +x the file, a command to execute the file, and the script must print its result to STDOUT.
-    Ensure the Bash block contains no line breaks inside script commands except where delimiting file-write content from execution commands.
-    If absolutely no commands are needed, the BASH block must contain only the word: false
-    Do not provide multiple alternative branches in one response; choose the single most likely next step.
-    Commands in BASH must not emit user-facing reports by default.
-    If additional information from the user is required, or you have doubts about the correctness or logic of the current process, ask all necessary questions in Russian. You may ask multiple questions at once. In this case, the BASH block must contain only the word: false
-    Use false in the BASH block whenever it would otherwise be empty in the described circumstances, including cases where no commands are needed due to missing user input or required clarification.
-    When a command may produce excessively large output, it is allowed to apply filtering, truncation, or structured marking to keep the output within reasonable bounds for model processing.
-    Formatting or marking of truncated/filtered output is permitted to preserve structure.
-    BASH may include creating files and executing them, but must remain runnable without manual editing unless explicitly unavoidable; if unavoidable, mark assumptions in HUMAN and keep BASH runnable.
+    You are a DevOps/SRE terminal assistant helping diagnose and fix Linux systems.
+    Output exactly two blocks in this order:
+    HUMAN:
+    <Russian text for operator, never sent to terminal>
+
+    BASH:
+    <Executable minimal diagnostics or one corrective action, no Markdown, no backticks, no numbering, no interaction>
+
+    Rules:
+    1. Diagnostic command execution is allowed and encouraged.
+    2. Work one step at a time = group of commands forming one logical action until a decision point, need for clarification, or start of a long operation. Ask the operator in HUMAN (Russian) whenever anything is unclear or required for correctness; in that case BASH must be: false. Multiple minimal commands per step are allowed and encouraged, but should remain human-comprehensible.
+    3. Before choosing the next step, first analyze the provided context/history to identify actions and decisions already performed; avoid repeating completed steps and only propose the next unmet logical action.
+    4. When providing Bash solutions or diagnostics, you must output only valid Bash one-liners with inline conditional logic, or write a script to a file and execute it exactly in this order within the same Bash block: (1) write the script to a file, (2) make it executable, (3) run it. The application will directly stream your Bash block to the console and will not save or wrap multi-line scripts unless written to a file as specified. Do not return standalone multi-line Bash script text without the file-write and execute sequence.
+    5. If writing a script to a file (via heredoc or echo), the Bash block must include immediately after the script content: a command to chmod +x the file, a command to execute the file, and the script must print its result to STDOUT.
+    6. If absolutely no commands are needed, the BASH block must contain only the word: false
+    7. Do not provide multiple alternative branches in one response; choose the single most likely next step or ask operator.
+    8. Use false in the BASH block whenever it would otherwise be empty in the described circumstances, including cases where no commands are needed due to missing user input or required clarification.
+    9. Use jq when JSON filtering is needed.
+    10. Diagnostic output must be minimal and filtered when large (>100 lines).
+    11. Logging to files (e.g., /tmp/*.log) is allowed.
     """
 ).strip()
 
@@ -165,6 +167,16 @@ def read_file(path):
         return Path(path).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return ""
+
+
+def compose_instructions(base_instructions, pinned_notes):
+    pinned_text = (pinned_notes or "").strip()
+    if not pinned_text:
+        return base_instructions
+    base_text = base_instructions or ""
+    if base_text:
+        return f"PRIMARY INSTRUCTIONS:\n{pinned_text}\n\n{base_text}"
+    return f"PRIMARY INSTRUCTIONS:\n{pinned_text}"
 
 
 def ensure_empty_file(path):
@@ -479,6 +491,10 @@ def call_model_blocking(api_key, model, context, paths, filters, instructions):
     human_path = str(run_directory / "human.txt")
     bash_path = str(run_directory / "bash.sh")
     client = OpenAI(api_key=api_key)
+    config = load_config()
+    paths = resolve_paths("tmux-llm")
+    logger, log_path, log_exc = open_log(paths, config.get("logging"))
+    logger.info("instructions {}, context{}",instructions,context)
     response = client.responses.create(model=model, instructions=instructions, input=context)
     raw_output = (response.output_text or "").replace("\r\n", "\n").strip() + "\n"
     raw_output = filters.apply(raw_output)
@@ -521,6 +537,7 @@ async def run_tmux_llm():
         raise SystemExit("EMPTY PANE_ID")
     run_directory = paths["run"]
     history_path = str(paths["hist"] / "history.jsonl")
+    pinned_notes_path = str(paths["hist"] / "pinned_notes.txt")
     capture_path = str(run_directory / "capture.txt")
     notes_path = str(run_directory / "notes.txt")
     human_path = str(run_directory / "human.txt")
@@ -669,6 +686,7 @@ async def run_tmux_llm():
         application.invalidate()
         try:
             ensure_empty_file(history_path)
+            ensure_empty_file(pinned_notes_path)
             session_state["pending"] = None
             session_state["context_baseline"] = None
             full_capture, new_limit = await asyncio.to_thread(capture_full_context)
@@ -882,9 +900,11 @@ async def run_tmux_llm():
             set_status("Previous command not finished; wait for preview refresh.")
             return
         send_state["busy"] = True
-        notes_text = filters.apply(notes_area.text).strip()
-        if not notes_text:
+        notes_input = filters.apply(notes_area.text).strip()
+        if not notes_input:
             notes_text = "(none)"
+        else:
+            notes_text = notes_input
         write_file(notes_path, notes_text)
         set_status("Sending to model...")
         application.invalidate()
@@ -896,12 +916,17 @@ async def run_tmux_llm():
             session_state["before_capture"] = before_capture
             init_capture_for_context = compute_init_context(before_capture)
             history_rows = load_history(history_path, max_history_turns, filters)
+            pinned_notes = filters.apply(read_file(pinned_notes_path)).strip()
+            if not pinned_notes and notes_input:
+                write_file(pinned_notes_path, notes_input)
+                pinned_notes = notes_input
             context_messages = build_context_messages(
                 init_capture_for_context, history_rows, notes_text, filters, line_count=capture_line_limit
             )
             logger.info("Sending prompt to model={} captured_lines={} notes_length={}", model, capture_line_limit, len(notes_text))
+            combined_instructions = compose_instructions(config["instructions"], pinned_notes)
             human_output, bash_output = await event_loop.run_in_executor(
-                None, call_model_blocking, api_key, model, context_messages, paths, filters, config["instructions"]
+                None, call_model_blocking, api_key, model, context_messages, paths, filters, combined_instructions
             )
             human_area.text = human_output
             bash_area.text = bash_output
